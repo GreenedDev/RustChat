@@ -1,0 +1,9 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.38.0", features = ["full"] }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+uuid = { version = "1.9.0", features = ["v4", "fast-rng"] }
