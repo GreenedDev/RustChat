@@ -7,9 +7,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq)]
+enum MessageType {
+    Chat,
+    Broadcast,
+    Alert,
+    Kick,
+}
+
 #[derive(Debug, Clone)]
 struct Message {
-    message_type: String,
+    message_type: MessageType,
     sender_uuid: String,
     sender_username: String,
     message: String,
@@ -17,7 +25,7 @@ struct Message {
 
 impl Message {
     fn new(
-        message_type: String,
+        message_type: MessageType,
         sender_uuid: String,
         sender_username: String,
         message: String,
@@ -31,7 +39,7 @@ impl Message {
     }
     fn blank() -> Message {
         Message {
-            message_type: "error".to_string(),
+            message_type: MessageType::Chat,
             sender_uuid: "error".to_string(),
             sender_username: "error".to_string(),
             message: "error".to_string(),
@@ -186,7 +194,7 @@ async fn main() {
                                 .unwrap();
                             let account = account_iter.next().unwrap().unwrap();
                             Ok(Message {
-                                message_type: "chat".to_string(),
+                                message_type: MessageType::Chat,
                                 sender_uuid: uuid,
                                 sender_username: account.username,
                                 message: row.get(1)?,
@@ -295,7 +303,7 @@ async fn main() {
                         .send((
                             String::new(),
                             Message::new(
-                                "alert".to_string(),
+                                MessageType::Alert,
                                 "error".to_string(),
                                 "error".to_string(),
                                 rest_of_command.to_string(),
@@ -329,7 +337,7 @@ async fn main() {
                         .send((
                             String::new(),
                             Message::new(
-                                "kick".to_string(),
+                                MessageType::Kick,
                                 "error".to_string(),
                                 username_or_ip,
                                 reason,
@@ -462,14 +470,14 @@ async fn main() {
                                                                             }
                                                                             write_str(&mut buf_reader, "You can start typing.\n").await;
 
-                                                                            msg_tx.send((socket_address.clone(), Message::new("broadcast_to_everyone".to_string(), account.uuid.clone(), username.clone(), format!("{} Joined the chat!\n", username)) )).unwrap();
+                                                                            msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, account.uuid.clone(), username.clone(), format!("{} Joined the chat!\n", username)) )).unwrap();
 
                                                                             db_tx.send(DatabaseRequest::new("get_all_messages".to_string(), username.clone(), Account::blank(), Message::blank(), SystemTime::now())).unwrap();
 
 
                                                                         } else {
-                                                                            msg_tx.send((socket_address.clone(), Message::new("chat".to_string(), account.uuid.clone(), username.clone(), line.trim().to_string()))).unwrap();
-                                                                            db_tx.send(DatabaseRequest::new("messages".to_string(), account.uuid.clone(), Account::blank(), Message::new("chat".to_string(), account.uuid.clone(), "error".to_string(), line.trim().to_string()), SystemTime::now())).unwrap();
+                                                                            msg_tx.send((socket_address.clone(), Message::new(MessageType::Chat, account.uuid.clone(), username.clone(), line.trim().to_string()))).unwrap();
+                                                                            db_tx.send(DatabaseRequest::new("messages".to_string(), account.uuid.clone(), Account::blank(), Message::new(MessageType::Chat, account.uuid.clone(), "error".to_string(), line.trim().to_string()), SystemTime::now())).unwrap();
                                                                             println!("{socket_address} {username} typed: {}", line.trim());
                                                                         }
                             line.clear();
@@ -481,7 +489,10 @@ async fn main() {
                                                             result = msg_rx.recv() => {
                                                                 match result {
                                                                     Ok((sender_ip, message)) => {
-                                                                        if message.message_type.eq("chat") {
+                                                                        match message.message_type {
+
+
+                                                                        MessageType::Chat => {
                                                                             if message.sender_uuid == account.uuid && sender_ip == socket_address {
                                                                                 continue 'message_reading_loop;
                                                                             }
@@ -492,12 +503,12 @@ async fn main() {
                                                                             };
                                                                             write_string(&mut buf_reader, broadcast_message).await;
                                                                             buf_reader.flush().await.unwrap();
-                                                                        } else if message.message_type.eq("broadcast_to_everyone") {
+                                                                        } MessageType::Broadcast => {
                                                                             write_string(&mut buf_reader, message.message).await;
-                                                                        } else  if message.message_type.eq("alert") {
+                                                                        } MessageType::Alert =>  {
                                                                             let broadcast_message = format!("{M_S}Server message: {}\n{M_S}", message.message);
                                                                             write_string(&mut buf_reader, broadcast_message).await;
-                                                                        } else if message.message_type.eq("kick") {
+                                                                        } MessageType::Kick => {
                                                                             //this is not a bug.
                                                                             if message.sender_username != account.username && message.sender_username != account.ip_addr {
                                                                                 continue 'message_reading_loop;
@@ -506,10 +517,10 @@ async fn main() {
                                                                             buf_reader.shutdown().await.expect("TODO: panic message");
 
                                                                             println!("{} has been kicked from the server!", message.message);
-                                                                            msg_tx.send((socket_address.clone(), Message::new("broadcast_to_everyone".to_string(), "error".to_string(), "error".to_string(), format!("{} has been kicked from the server!\n", message.message)))).unwrap();
+                                                                            msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, "error".to_string(), "error".to_string(), format!("{} has been kicked from the server!\n", message.message)))).unwrap();
                                                                             continue 'loop_of_this_connection;
                                                                         }
-                                                                    }
+                                                                    }}
                                                                     Err(_) => {continue;}
                                                                 }
                                                             }
