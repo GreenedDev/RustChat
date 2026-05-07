@@ -40,14 +40,14 @@ impl Message {
 }
 #[derive(Debug, Clone)]
 struct PasswordCheckResponseValues {
-    requester: String, //username of requester
-    account: Account,  //response account
+    requester: String,        //username of requester
+    account: Option<Account>, //response account
     send_date: SystemTime,
 }
 #[derive(Debug, Clone)]
 struct UsernameCheckResponseValues {
-    requester: String, //username of requester
-    account: Account,  //response account
+    requester: String,        //username of requester
+    account: Option<Account>, //response account
     send_date: SystemTime,
 }
 #[derive(Debug, Clone)]
@@ -99,14 +99,6 @@ impl Account {
             username,
             ip_addr,
             password,
-        }
-    }
-    fn blank() -> Account {
-        Account {
-            uuid: "error".to_string(),
-            username: "error".to_string(),
-            ip_addr: "error".to_string(),
-            password: "error".to_string(),
         }
     }
 }
@@ -237,13 +229,13 @@ async fn main() {
                                 })
                             })
                             .unwrap();
-                        let mut result = Account::blank();
+                        let mut result = None;
                         for account in accounts_iter {
                             let account_unwrapped = account.unwrap();
                             if account_unwrapped.username != request.requester {
                                 continue;
                             }
-                            result = account_unwrapped;
+                            result = Some(account_unwrapped);
                         }
                         db_response_tx
                             .send(DatabaseResponse::PasswordCheck(
@@ -270,13 +262,13 @@ async fn main() {
                                 })
                             })
                             .unwrap();
-                        let mut result = Account::blank();
+                        let mut result = None;
                         for account in accounts_iter {
                             let account_unwrapped = account.unwrap();
                             if account_unwrapped.username != request.requester {
                                 continue;
                             }
-                            result = account_unwrapped;
+                            result = Some(account_unwrapped);
                             break;
                         }
                         db_response_tx
@@ -421,7 +413,7 @@ async fn main() {
                         write_str(&mut buf_reader, "Enter your username.\n").await;
                         let mut is_about_to_type_username = true;
                         let mut username = String::new();
-                        let mut account = Account::blank();
+                        let mut account = None;
                         'message_reading_loop: loop {
                             tokio::select! {
                                                                                                                                                result = buf_reader.read_line(&mut line) => {
@@ -461,13 +453,17 @@ async fn main() {
                                                                                                                                                                        if response.requester != username || response.send_date != now {
                                                                                                                                                                            continue 'db_response_loop;
                                                                                                                                                                        }
-                                                                                                                                                                       if pass != response.account.password {
+                                                                                                                                                                       let Some(response_account) = response.account else {
+                                                                                                                                                                           write_str(&mut buf_reader, "This account doesn't exist?\n").await;
+                                                                                                                                                                           break 'loop_of_this_connection;
+                                                                                                                                                                       };
+                                                                                                                                                                       if pass != response_account.password {
                                                                                                                                                                            write_str(&mut buf_reader, "Password is incorrect.\n").await;
                                                                                                                                                                            buf_reader.shutdown().await.unwrap();
                                                                                                                                                                            continue 'loop_of_this_connection;
                                                                                                                                                                        }
                                                                                                                                                                        write_str(&mut buf_reader, "Log-in Success.\n").await;
-                                                                                                                                                                       account = Account::new(response.account.uuid, response.account.username, socket_address.clone(), response.account.password);
+                                                                                                                                                                       account = Some(Account::new(response_account.uuid, response_account.username, socket_address.clone(), response_account.password));
                                                                                                                                                                        break 'db_response_loop;
                                                                                                                                                                    }
                                                                                                                                                                } else {
@@ -481,14 +477,15 @@ async fn main() {
                                                                                                                                                                        if response.requester != username || response.send_date != now {
                                                                                                                                                                            continue 'db_response_loop;
                                                                                                                                                                        }
-                                                                                                                                                                       if response.account.uuid != "error" { //then user was found
+
+                                                                                                                                                                       if response.account.is_some() { //then user was found
                                                                                                                                                                            write_str(&mut buf_reader, "Username is already taken.\n").await;
                                                                                                                                                                            buf_reader.shutdown().await.unwrap();
                                                                                                                                                                            continue 'loop_of_this_connection;
                                                                                                                                                                        }
                                                                                                                                                                        let uuid = Uuid::new_v4().to_string();
-                                                                                                                                                                       account = Account::new(uuid.clone(), username.clone(), socket_address.clone(), pass.clone());
-                                                                                                                                                                       db_tx.send(DatabaseRequest::RegisterUser(RegisterUserRequestValues {account: account.clone(), _send_date: now})).unwrap();
+                                                                                                                                                                       account = Some(Account::new(uuid.clone(), username.clone(), socket_address.clone(), pass.clone()));
+                                                                                                                                                                       db_tx.send(DatabaseRequest::RegisterUser(RegisterUserRequestValues {account: account.clone().unwrap(), _send_date: now})).unwrap();
                                                                                                                                                                        write_str(&mut buf_reader, "You have successfully registered.\n").await;
 
                                                                                                                                                                        break 'db_response_loop;
@@ -496,12 +493,12 @@ async fn main() {
                                                                                                                                                                }
                                                                                                                                                                write_str(&mut buf_reader, "You can start typing.\n").await;
 
-                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, account.uuid.clone(), username.clone(), format!("{} Joined the chat!\n", username)) )).unwrap();
+                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, account.clone().unwrap().uuid.clone(), username.clone(), format!("{} Joined the chat!\n", username)) )).unwrap();
                                                         db_tx.send(DatabaseRequest::GetPreviousMessages(GetPreviousMessagesRequestValues {requester: username.clone(), _send_date: SystemTime::now()})).unwrap();
                                                                                                                                                            } else {
-                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Chat, account.uuid.clone(), username.clone(), line.trim().to_string()))).unwrap();
+                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Chat, account.clone().unwrap().uuid.clone(), username.clone(), line.trim().to_string()))).unwrap();
 
-                            db_tx.send(DatabaseRequest::MessageAddition(MessageAdditionRequestValues { requester: account.uuid.clone(), message: Message::new(MessageType::Chat, account.uuid.clone(), "error".to_string(), line.trim().to_string()), _send_date: SystemTime::now() })).unwrap();
+                            db_tx.send(DatabaseRequest::MessageAddition(MessageAdditionRequestValues { requester: account.clone().unwrap().uuid.clone(), message: Message::new(MessageType::Chat, account.clone().unwrap().uuid.clone(), "error".to_string(), line.trim().to_string()), _send_date: SystemTime::now() })).unwrap();
                                                                                                                                                                println!("{socket_address} {username} typed: {}", line.trim());
                                                                                                                                                            }
                                                                                                                line.clear();
@@ -517,7 +514,7 @@ async fn main() {
 
 
                                                                                                                                                            MessageType::Chat => {
-                                                                                                                                                               if message.sender_uuid == account.uuid && sender_ip == socket_address {
+                                                                                                                                                               if message.sender_uuid == account.clone().unwrap().uuid && sender_ip == socket_address {
                                                                                                                                                                    continue 'message_reading_loop;
                                                                                                                                                                }
                                                                                                                                                                let broadcast_message = if message.sender_username.is_empty() {
@@ -534,7 +531,7 @@ async fn main() {
                                                                                                                                                                write_string(&mut buf_reader, broadcast_message).await;
                                                                                                                                                            } MessageType::Kick => {
                                                                                                                                                                //this is not a bug.
-                                                                                                                                                               if message.sender_username != account.username && message.sender_username != account.ip_addr {
+                                                                                                                                                               if message.sender_username != account.clone().unwrap().username && message.sender_username != account.clone().unwrap().ip_addr {
                                                                                                                                                                    continue 'message_reading_loop;
                                                                                                                                                                }
                                                                                                                                                                write_string(&mut buf_reader, format!("{M_S}You are kicked from the server! \nReason: {}\n{M_S}", message.message)).await;
