@@ -37,51 +37,61 @@ impl Message {
             message,
         }
     }
-    fn blank() -> Message {
-        Message {
-            message_type: MessageType::Chat,
-            sender_uuid: "error".to_string(),
-            sender_username: "error".to_string(),
-            message: "error".to_string(),
-        }
-    }
+}
+#[derive(Debug, Clone)]
+struct PasswordCheckResponseValues {
+    requester: String, //username of requester
+    account: Account,  //response account
+    send_date: SystemTime,
+}
+#[derive(Debug, Clone)]
+struct UsernameCheckResponseValues {
+    requester: String, //username of requester
+    account: Account,  //response account
+    send_date: SystemTime,
+}
+#[derive(Debug, Clone)]
+enum DatabaseResponse {
+    PasswordCheck(PasswordCheckResponseValues),
+    UsernameCheck(UsernameCheckResponseValues),
 }
 
 #[derive(Debug, Clone)]
-struct DatabaseResponse {
-    response_type: String,
-    requester: String,     //username of
-    account: Account,      //response
-    send_date: SystemTime, //the time request was sent
+struct RegisterUserRequestValues {
+    account: Account,
+    _send_date: SystemTime,
+}
+#[derive(Debug, Clone)]
+struct MessageAdditionRequestValues {
+    requester: String,
+    message: Message,
+    _send_date: SystemTime,
 }
 
 #[derive(Debug, Clone)]
-struct DatabaseRequest {
-    request_type: String,  //response type
-    requester: String,     //username
-    account: Account,      //response
-    message: Message,      //message
-    send_date: SystemTime, //the time request was sent
+struct GetPreviousMessagesRequestValues {
+    requester: String,
+    _send_date: SystemTime,
+}
+#[derive(Debug, Clone)]
+struct UsernameCheckRequestValues {
+    requester: String, //username of requester
+    send_date: SystemTime,
 }
 
-impl DatabaseRequest {
-    fn new(
-        request_type: String,
-        requester: String,
-        account: Account,
-        message: Message,
-        send_date: SystemTime,
-    ) -> DatabaseRequest {
-        DatabaseRequest {
-            request_type,
-            requester, //username
-            account,   //response
-            message,
-            send_date, //the request send date.
-        }
-    }
+#[derive(Debug, Clone)]
+struct PasswordCheckRequestValues {
+    requester: String, //username of requester
+    send_date: SystemTime,
 }
-
+#[derive(Debug, Clone)]
+enum DatabaseRequest {
+    RegisterUser(RegisterUserRequestValues),
+    MessageAddition(MessageAdditionRequestValues),
+    GetPreviousMessages(GetPreviousMessagesRequestValues),
+    PasswordCheck(PasswordCheckRequestValues),
+    UsernameCheck(UsernameCheckRequestValues),
+}
 impl Account {
     fn new(uuid: String, username: String, ip_addr: String, password: String) -> Account {
         Account {
@@ -152,125 +162,133 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 let request = db_rx.recv().await.unwrap();
-                if request.request_type == "register_user" {
-                    conn.execute(
-                        "INSERT INTO accounts (uuid, username, password) VALUES (?1, ?2, ?3)",
-                        (
-                            request.account.uuid,
-                            request.account.username,
-                            request.account.password,
-                        ),
-                    )
-                    .unwrap();
-                    continue;
-                } else if request.request_type == "messages" {
-                    conn.execute(
-                        "INSERT INTO messages (sender, message) VALUES (?1, ?2)",
-                        (request.requester, request.message.message),
-                    )
-                    .unwrap();
-                    continue;
-                } else if request.request_type == "get_all_messages" {
-                    let mut stmt = conn
-                        .prepare("SELECT sender, message FROM messages")
+                match request {
+                    DatabaseRequest::RegisterUser(request) => {
+                        conn.execute(
+                            "INSERT INTO accounts (uuid, username, password) VALUES (?1, ?2, ?3)",
+                            (
+                                request.account.uuid,
+                                request.account.username,
+                                request.account.password,
+                            ),
+                        )
                         .unwrap();
+                        continue;
+                    }
+                    DatabaseRequest::MessageAddition(request) => {
+                        conn.execute(
+                            "INSERT INTO messages (sender, message) VALUES (?1, ?2)",
+                            (request.requester, request.message.message),
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    DatabaseRequest::GetPreviousMessages(request) => {
+                        let mut stmt = conn
+                            .prepare("SELECT sender, message FROM messages")
+                            .unwrap();
 
-                    let message_iter = stmt
-                        .query_map([], |row| {
-                            let uuid: String = row.get(0)?;
-                            let mut stmt = conn
-                                .prepare("SELECT uuid, username FROM accounts WHERE uuid = ?")
-                                .unwrap();
+                        let message_iter = stmt
+                            .query_map([], |row| {
+                                let uuid: String = row.get(0)?;
+                                let mut stmt = conn
+                                    .prepare("SELECT uuid, username FROM accounts WHERE uuid = ?")
+                                    .unwrap();
 
-                            let mut account_iter = stmt
-                                .query_map([uuid.clone()], |account_row| {
-                                    Ok(Account {
-                                        uuid: account_row.get(0)?,
-                                        username: account_row.get(1)?,
-                                        ip_addr: "error".to_string(), // you can improve this
-                                        password: "error".to_string(),
+                                let mut account_iter = stmt
+                                    .query_map([uuid.clone()], |account_row| {
+                                        Ok(Account {
+                                            uuid: account_row.get(0)?,
+                                            username: account_row.get(1)?,
+                                            ip_addr: "error".to_string(), // you can improve this
+                                            password: "error".to_string(),
+                                        })
                                     })
+                                    .unwrap();
+                                let account = account_iter.next().unwrap().unwrap();
+                                Ok(Message {
+                                    message_type: MessageType::Chat,
+                                    sender_uuid: uuid,
+                                    sender_username: account.username,
+                                    message: row.get(1)?,
                                 })
-                                .unwrap();
-                            let account = account_iter.next().unwrap().unwrap();
-                            Ok(Message {
-                                message_type: MessageType::Chat,
-                                sender_uuid: uuid,
-                                sender_username: account.username,
-                                message: row.get(1)?,
                             })
-                        })
-                        .unwrap();
-                    let mut result = Vec::new();
-                    for message in message_iter {
-                        result.push(message.unwrap());
-                    }
-                    vec_of_messages_to_user_tx
-                        .send((request.requester, result))
-                        .unwrap();
-                } else if request.request_type == "password_request" {
-                    let mut stmt = conn
-                        .prepare("SELECT uuid, username, password FROM accounts")
-                        .unwrap();
-
-                    let accounts_iter = stmt
-                        .query_map([], |row| {
-                            Ok(Account {
-                                uuid: row.get(0)?,
-                                username: row.get(1)?,
-                                ip_addr: "error".to_string(),
-                                password: row.get(2)?,
-                            })
-                        })
-                        .unwrap();
-                    let mut result = Account::blank();
-                    for account in accounts_iter {
-                        let account_unwrapped = account.unwrap();
-                        if account_unwrapped.username != request.requester {
-                            continue;
+                            .unwrap();
+                        let mut result = Vec::new();
+                        for message in message_iter {
+                            result.push(message.unwrap());
                         }
-                        result = account_unwrapped;
+                        vec_of_messages_to_user_tx
+                            .send((request.requester, result))
+                            .unwrap();
                     }
-                    db_response_tx
-                        .send(DatabaseResponse {
-                            response_type: "password_request".to_string(),
-                            requester: request.requester,
-                            account: result,
-                            send_date: request.send_date,
-                        })
-                        .unwrap();
-                } else if request.request_type == "username_check" {
-                    let mut stmt = conn
-                        .prepare("SELECT uuid, username, password FROM accounts")
-                        .unwrap();
+                    DatabaseRequest::PasswordCheck(request) => {
+                        let mut stmt = conn
+                            .prepare("SELECT uuid, username, password FROM accounts")
+                            .unwrap();
 
-                    let accounts_iter = stmt
-                        .query_map([], |row| {
-                            Ok(Account {
-                                uuid: row.get(0)?,
-                                username: row.get(1)?,
-                                ip_addr: "error".to_string(),
-                                password: row.get(2)?,
+                        let accounts_iter = stmt
+                            .query_map([], |row| {
+                                Ok(Account {
+                                    uuid: row.get(0)?,
+                                    username: row.get(1)?,
+                                    ip_addr: "error".to_string(),
+                                    password: row.get(2)?,
+                                })
                             })
-                        })
-                        .unwrap();
-                    let mut result = Account::blank();
-                    for account in accounts_iter {
-                        let account_unwrapped = account.unwrap();
-                        if account_unwrapped.username != request.requester {
-                            continue;
+                            .unwrap();
+                        let mut result = Account::blank();
+                        for account in accounts_iter {
+                            let account_unwrapped = account.unwrap();
+                            if account_unwrapped.username != request.requester {
+                                continue;
+                            }
+                            result = account_unwrapped;
                         }
-                        result = account_unwrapped;
-                        break;
+                        db_response_tx
+                            .send(DatabaseResponse::PasswordCheck(
+                                PasswordCheckResponseValues {
+                                    requester: request.requester,
+                                    account: result,
+                                    send_date: request.send_date,
+                                },
+                            ))
+                            .unwrap();
                     }
-                    db_response_tx
-                        .send(DatabaseResponse {
-                            response_type: "username_check".to_string(),
-                            requester: request.requester,
-                            account: result,
-                            send_date: request.send_date,
-                        })
-                        .unwrap();
+                    DatabaseRequest::UsernameCheck(request) => {
+                        let mut stmt = conn
+                            .prepare("SELECT uuid, username, password FROM accounts")
+                            .unwrap();
+
+                        let accounts_iter = stmt
+                            .query_map([], |row| {
+                                Ok(Account {
+                                    uuid: row.get(0)?,
+                                    username: row.get(1)?,
+                                    ip_addr: "error".to_string(),
+                                    password: row.get(2)?,
+                                })
+                            })
+                            .unwrap();
+                        let mut result = Account::blank();
+                        for account in accounts_iter {
+                            let account_unwrapped = account.unwrap();
+                            if account_unwrapped.username != request.requester {
+                                continue;
+                            }
+                            result = account_unwrapped;
+                            break;
+                        }
+                        db_response_tx
+                            .send(DatabaseResponse::UsernameCheck(
+                                UsernameCheckResponseValues {
+                                    requester: request.requester,
+                                    account: result,
+                                    send_date: request.send_date,
+                                },
+                            ))
+                            .unwrap();
+                    }
                 }
             }
         });
@@ -406,142 +424,148 @@ async fn main() {
                         let mut account = Account::blank();
                         'message_reading_loop: loop {
                             tokio::select! {
-                                                            result = buf_reader.read_line(&mut line) => {
-                                                                match result {
-                                                                    Ok(bytes_read) => {
-                                                                        if bytes_read == 0 {
-                                                                            line.clear();
-                                                                            println!("{socket_address} disconnected!");
-                                                                            break 'loop_of_this_connection;
-                                                                        }
-                                                                        if line.trim().is_empty() {
-                                                                            line.clear();
-                                                                            continue 'message_reading_loop;
-                                                                        }
+                                                                                                                                               result = buf_reader.read_line(&mut line) => {
+                                                                                                                                                   match result {
+                                                                                                                                                       Ok(bytes_read) => {
+                                                                                                                                                           if bytes_read == 0 {
+                                                                                                                                                               line.clear();
+                                                                                                                                                               println!("{socket_address} disconnected!");
+                                                                                                                                                               break 'loop_of_this_connection;
+                                                                                                                                                           }
+                                                                                                                                                           if line.trim().is_empty() {
+                                                                                                                                                               line.clear();
+                                                                                                                                                               continue 'message_reading_loop;
+                                                                                                                                                           }
 
-                                                                        if is_about_to_type_username {
-                                                                            username = line.trim().to_string();
-                                                                            println!("{socket_address} has entered his username as {username}");
+                                                                                                                                                           if is_about_to_type_username {
+                                                                                                                                                               username = line.trim().to_string();
+                                                                                                                                                               println!("{socket_address} has entered his username as {username}");
 
-                                                                            write_str(&mut buf_reader, "Enter your password.\n").await;
-                                                                            let mut pass = String::new();
-                                                                            if buf_reader.read_line(&mut pass).await.unwrap() == 0 {
-                                                                                continue 'message_reading_loop;
-                                                                            }
-                                                                            pass = pass.trim().to_string();
-                                                                            if r_or_l == "l" {
-                                                                                let now = SystemTime::now();
-                                                                                db_tx.send(DatabaseRequest::new("password_request".to_string(),username.clone(),Account::blank(), Message::blank(), now)).unwrap();
-                                                                                'db_response_loop: loop {
-                                                                                    let response = db_response_rx.recv().await.unwrap();
-                                                                                    if response.requester != username || response.response_type != "password_request" || response.send_date != now {
-                                                                                        continue 'db_response_loop;
-                                                                                    }
-                                                                                    if pass != response.account.password {
-                                                                                        write_str(&mut buf_reader, "Password is incorrect.\n").await;
-                                                                                        buf_reader.shutdown().await.unwrap();
-                                                                                        continue 'loop_of_this_connection;
-                                                                                    }
-                                                                                    write_str(&mut buf_reader, "Log-in Success.\n").await;
-                                                                                    account = Account::new(response.account.uuid, response.account.username, socket_address.clone(), response.account.password);
-                                                                                    break 'db_response_loop;
-                                                                                }
-                                                                            } else {
-                                                                                let now = SystemTime::now();
-                                                                                db_tx.send(DatabaseRequest::new("username_check".to_string(), username.clone(), Account::blank(), Message::blank(), now)).unwrap();
-                                                                                'db_response_loop: loop {
-                                                                                    let response = db_response_rx.recv().await.unwrap();
-                                                                                    if response.requester != username || response.response_type != "username_check" || response.send_date != now {
-                                                                                        continue 'db_response_loop;
-                                                                                    }
-                                                                                    if response.account.uuid != "error" { //then user was found
-                                                                                        write_str(&mut buf_reader, "Username is already taken.\n").await;
-                                                                                        buf_reader.shutdown().await.unwrap();
-                                                                                        continue 'loop_of_this_connection;
-                                                                                    }
-                                                                                    let uuid = Uuid::new_v4().to_string();
-                                                                                    account = Account::new(uuid.clone(), username.clone(), socket_address.clone(), pass.clone());
-                                                                                    db_tx.send(DatabaseRequest::new("register_user".to_string(), username.clone(), account.clone(), Message::blank(), SystemTime::now())).unwrap();
-
-                                                                                    write_str(&mut buf_reader, "You have successfully registered.\n").await;
-
-                                                                                    break 'db_response_loop;
-                                                                                }
-                                                                            }
-                                                                            write_str(&mut buf_reader, "You can start typing.\n").await;
-
-                                                                            msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, account.uuid.clone(), username.clone(), format!("{} Joined the chat!\n", username)) )).unwrap();
-
-                                                                            db_tx.send(DatabaseRequest::new("get_all_messages".to_string(), username.clone(), Account::blank(), Message::blank(), SystemTime::now())).unwrap();
+                                                                                                                                                               write_str(&mut buf_reader, "Enter your password.\n").await;
+                                                                                                                                                               let mut pass = String::new();
+                                                                                                                                                               if buf_reader.read_line(&mut pass).await.unwrap() == 0 {
+                                                                                                                                                                   continue 'message_reading_loop;
+                                                                                                                                                               }
+                                                                                                                                                               pass = pass.trim().to_string();
+                                                                                                                                                               if r_or_l == "l" {
+                                                                                                                                                                   let now = SystemTime::now();
+                                                                                                                                                                   db_tx.send(DatabaseRequest::PasswordCheck(PasswordCheckRequestValues { requester: username.clone(), send_date: now })).unwrap();                                                                                                                                                                   'db_response_loop: loop {
+                                                                                                                                                                       let response = db_response_rx.recv().await.unwrap();
+                                                                                                                                                                       let
+                                                                                                                                                                           DatabaseResponse::PasswordCheck(response) = response else {
+                                                                                                                                                                               continue 'db_response_loop;
+                                                                                                                                                                           };
 
 
-                                                                        } else {
-                                                                            msg_tx.send((socket_address.clone(), Message::new(MessageType::Chat, account.uuid.clone(), username.clone(), line.trim().to_string()))).unwrap();
-                                                                            db_tx.send(DatabaseRequest::new("messages".to_string(), account.uuid.clone(), Account::blank(), Message::new(MessageType::Chat, account.uuid.clone(), "error".to_string(), line.trim().to_string()), SystemTime::now())).unwrap();
-                                                                            println!("{socket_address} {username} typed: {}", line.trim());
-                                                                        }
-                            line.clear();
-                                                                        is_about_to_type_username = false;
-                                                                    }
-                                                                    Err(_) => {continue;}
-                                                                }
-                                                            }
-                                                            result = msg_rx.recv() => {
-                                                                match result {
-                                                                    Ok((sender_ip, message)) => {
-                                                                        match message.message_type {
+
+                                                                                                                                                                       if response.requester != username || response.send_date != now {
+                                                                                                                                                                           continue 'db_response_loop;
+                                                                                                                                                                       }
+                                                                                                                                                                       if pass != response.account.password {
+                                                                                                                                                                           write_str(&mut buf_reader, "Password is incorrect.\n").await;
+                                                                                                                                                                           buf_reader.shutdown().await.unwrap();
+                                                                                                                                                                           continue 'loop_of_this_connection;
+                                                                                                                                                                       }
+                                                                                                                                                                       write_str(&mut buf_reader, "Log-in Success.\n").await;
+                                                                                                                                                                       account = Account::new(response.account.uuid, response.account.username, socket_address.clone(), response.account.password);
+                                                                                                                                                                       break 'db_response_loop;
+                                                                                                                                                                   }
+                                                                                                                                                               } else {
+                                                                                                                                                                   let now = SystemTime::now();
+                                                                                                                                                                   db_tx.send(DatabaseRequest::UsernameCheck(UsernameCheckRequestValues { requester: username.clone(), send_date: now })).unwrap();                                                                                                            'db_response_loop: loop {
+                                                                                                                                                                       let response = db_response_rx.recv().await.unwrap();
+                                                                                   let
+                                                                                                                                                                           DatabaseResponse::UsernameCheck(response) = response else {
+                                                                                                                                                                               continue 'db_response_loop;
+                                                                                                                                                                           };
+                                                                                                                                                                       if response.requester != username || response.send_date != now {
+                                                                                                                                                                           continue 'db_response_loop;
+                                                                                                                                                                       }
+                                                                                                                                                                       if response.account.uuid != "error" { //then user was found
+                                                                                                                                                                           write_str(&mut buf_reader, "Username is already taken.\n").await;
+                                                                                                                                                                           buf_reader.shutdown().await.unwrap();
+                                                                                                                                                                           continue 'loop_of_this_connection;
+                                                                                                                                                                       }
+                                                                                                                                                                       let uuid = Uuid::new_v4().to_string();
+                                                                                                                                                                       account = Account::new(uuid.clone(), username.clone(), socket_address.clone(), pass.clone());
+                                                                                                                                                                       db_tx.send(DatabaseRequest::RegisterUser(RegisterUserRequestValues {account: account.clone(), _send_date: now})).unwrap();
+                                                                                                                                                                       write_str(&mut buf_reader, "You have successfully registered.\n").await;
+
+                                                                                                                                                                       break 'db_response_loop;
+                                                                                                                                                                   }
+                                                                                                                                                               }
+                                                                                                                                                               write_str(&mut buf_reader, "You can start typing.\n").await;
+
+                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, account.uuid.clone(), username.clone(), format!("{} Joined the chat!\n", username)) )).unwrap();
+                                                        db_tx.send(DatabaseRequest::GetPreviousMessages(GetPreviousMessagesRequestValues {requester: username.clone(), _send_date: SystemTime::now()})).unwrap();
+                                                                                                                                                           } else {
+                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Chat, account.uuid.clone(), username.clone(), line.trim().to_string()))).unwrap();
+
+                            db_tx.send(DatabaseRequest::MessageAddition(MessageAdditionRequestValues { requester: account.uuid.clone(), message: Message::new(MessageType::Chat, account.uuid.clone(), "error".to_string(), line.trim().to_string()), _send_date: SystemTime::now() })).unwrap();
+                                                                                                                                                               println!("{socket_address} {username} typed: {}", line.trim());
+                                                                                                                                                           }
+                                                                                                               line.clear();
+                                                                                                                                                           is_about_to_type_username = false;
+                                                                                                                                                       }
+                                                                                                                                                       Err(_) => {continue;}
+                                                                                                                                                   }
+                                                                                                                                               }
+                                                                                                                                               result = msg_rx.recv() => {
+                                                                                                                                                   match result {
+                                                                                                                                                       Ok((sender_ip, message)) => {
+                                                                                                                                                           match message.message_type {
 
 
-                                                                        MessageType::Chat => {
-                                                                            if message.sender_uuid == account.uuid && sender_ip == socket_address {
-                                                                                continue 'message_reading_loop;
-                                                                            }
-                                                                            let broadcast_message = if message.sender_username.is_empty() {
-                                                                                format!("{}\n", message.message)
-                                                                            } else {
-                                                                               format!("{}: {}\n", message.sender_username, message.message)
-                                                                            };
-                                                                            write_string(&mut buf_reader, broadcast_message).await;
-                                                                            buf_reader.flush().await.unwrap();
-                                                                        } MessageType::Broadcast => {
-                                                                            write_string(&mut buf_reader, message.message).await;
-                                                                        } MessageType::Alert =>  {
-                                                                            let broadcast_message = format!("{M_S}Server message: {}\n{M_S}", message.message);
-                                                                            write_string(&mut buf_reader, broadcast_message).await;
-                                                                        } MessageType::Kick => {
-                                                                            //this is not a bug.
-                                                                            if message.sender_username != account.username && message.sender_username != account.ip_addr {
-                                                                                continue 'message_reading_loop;
-                                                                            }
-                                                                            write_string(&mut buf_reader, format!("{M_S}You are kicked from the server! \nReason: {}\n{M_S}", message.message)).await;
-                                                                            buf_reader.shutdown().await.expect("TODO: panic message");
+                                                                                                                                                           MessageType::Chat => {
+                                                                                                                                                               if message.sender_uuid == account.uuid && sender_ip == socket_address {
+                                                                                                                                                                   continue 'message_reading_loop;
+                                                                                                                                                               }
+                                                                                                                                                               let broadcast_message = if message.sender_username.is_empty() {
+                                                                                                                                                                   format!("{}\n", message.message)
+                                                                                                                                                               } else {
+                                                                                                                                                                  format!("{}: {}\n", message.sender_username, message.message)
+                                                                                                                                                               };
+                                                                                                                                                               write_string(&mut buf_reader, broadcast_message).await;
+                                                                                                                                                               buf_reader.flush().await.unwrap();
+                                                                                                                                                           } MessageType::Broadcast => {
+                                                                                                                                                               write_string(&mut buf_reader, message.message).await;
+                                                                                                                                                           } MessageType::Alert =>  {
+                                                                                                                                                               let broadcast_message = format!("{M_S}Server message: {}\n{M_S}", message.message);
+                                                                                                                                                               write_string(&mut buf_reader, broadcast_message).await;
+                                                                                                                                                           } MessageType::Kick => {
+                                                                                                                                                               //this is not a bug.
+                                                                                                                                                               if message.sender_username != account.username && message.sender_username != account.ip_addr {
+                                                                                                                                                                   continue 'message_reading_loop;
+                                                                                                                                                               }
+                                                                                                                                                               write_string(&mut buf_reader, format!("{M_S}You are kicked from the server! \nReason: {}\n{M_S}", message.message)).await;
+                                                                                                                                                               buf_reader.shutdown().await.expect("TODO: panic message");
 
-                                                                            println!("{} has been kicked from the server!", message.message);
-                                                                            msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, "error".to_string(), "error".to_string(), format!("{} has been kicked from the server!\n", message.message)))).unwrap();
-                                                                            continue 'loop_of_this_connection;
-                                                                        }
-                                                                    }}
-                                                                    Err(_) => {continue;}
-                                                                }
-                                                            }
-                                                            result = vec_of_messages_to_user_rx.recv() => {
-                                                                match result {
-                                                                    Ok((target_username, messages)) => {
-                                                                        if target_username != username {
-                                                                            continue 'message_reading_loop;
-                                                                        }
-                                                                        let mut all = String::from("");
-                                                                        //probably more optimized
-                                                                        for message in messages {
-                                                                            all.push_str(&format!("{}: {}\n", message.sender_username, message.message));
-                                                                        }
-                                                                        write_string(&mut buf_reader, all).await;
-                                                                    }
-                                                                    Err(_) => {continue 'message_reading_loop;}
-                                                                }
-                                                            }
+                                                                                                                                                               println!("{} has been kicked from the server!", message.message);
+                                                                                                                                                               msg_tx.send((socket_address.clone(), Message::new(MessageType::Broadcast, "error".to_string(), "error".to_string(), format!("{} has been kicked from the server!\n", message.message)))).unwrap();
+                                                                                                                                                               continue 'loop_of_this_connection;
+                                                                                                                                                           }
+                                                                                                                                                       }}
+                                                                                                                                                       Err(_) => {continue;}
+                                                                                                                                                   }
+                                                                                                                                               }
+                                                                                                                                               result = vec_of_messages_to_user_rx.recv() => {
+                                                                                                                                                   match result {
+                                                                                                                                                       Ok((target_username, messages)) => {
+                                                                                                                                                           if target_username != username {
+                                                                                                                                                               continue 'message_reading_loop;
+                                                                                                                                                           }
+                                                                                                                                                           let mut all = String::from("");
+                                                                                                                                                           //probably more optimized
+                                                                                                                                                           for message in messages {
+                                                                                                                                                               all.push_str(&format!("{}: {}\n", message.sender_username, message.message));
+                                                                                                                                                           }
+                                                                                                                                                           write_string(&mut buf_reader, all).await;
+                                                                                                                                                       }
+                                                                                                                                                       Err(_) => {continue 'message_reading_loop;}
+                                                                                                                                                   }
+                                                                                                                                               }
 
-                                                        }
+                                                                                                                                           }
                         }
                     }
                     Err(_) => {
