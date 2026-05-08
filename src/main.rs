@@ -1,8 +1,8 @@
-use rusqlite::Connection;
 use std::string::ToString;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_rusqlite::rusqlite::Connection;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,7 +98,6 @@ async fn main() {
         (),
     )
     .unwrap();
-    //sender_ip, msg
     let (msg_tx, _msg_rx) = broadcast::channel::<(String, Message)>(10);
 
     let (db_tx, mut db_rx) = mpsc::channel::<DatabaseRequest>(10);
@@ -128,40 +127,28 @@ async fn main() {
                     }
                     DatabaseRequest::GetPreviousMessages { resp } => {
                         let mut stmt = conn
-                            .prepare("SELECT sender, message FROM messages")
+                            .prepare(
+                                "SELECT m.sender, a.username, m.message 
+                     FROM messages m 
+                     JOIN accounts a ON m.sender = a.uuid 
+                     LIMIT 50",
+                            )
                             .unwrap();
 
-                        let message_iter = stmt
+                        let msgs = stmt
                             .query_map([], |row| {
-                                let uuid: String = row.get(0)?;
-                                let mut stmt = conn
-                                    .prepare("SELECT uuid, username FROM accounts WHERE uuid = ?")
-                                    .unwrap();
-
-                                let account = stmt.query_row([uuid.clone()], |account_row| {
-                                    Ok(Account {
-                                        uuid: account_row.get(0)?,
-                                        username: account_row.get(1)?,
-                                        ip_addr: "error".to_string(), // you can improve this
-                                        password: "error".to_string(),
-                                    })
-                                })?;
                                 Ok(Message {
                                     message_type: MessageType::Chat,
-                                    sender_uuid: uuid,
-                                    sender_username: account.username,
-                                    message: row.get(1)?,
+                                    sender_uuid: row.get(0)?,
+                                    sender_username: row.get(1)?,
+                                    message: row.get(2)?,
                                 })
                             })
-                            .unwrap();
-                        let mut previous_messages = Vec::new();
-                        for message_result in message_iter {
-                            let Ok(message) = message_result else {
-                                continue;
-                            };
-                            previous_messages.push(message);
-                        }
-                        resp.send(previous_messages).unwrap();
+                            .unwrap()
+                            .filter_map(|m| m.ok())
+                            .collect();
+
+                        let _ = resp.send(msgs);
                     }
                     DatabaseRequest::AccountRequest { username, resp } => {
                         let result = conn
@@ -187,8 +174,6 @@ async fn main() {
             }
         });
     }
-
-    let (new_connections_tx, _new_connections_rx) = broadcast::channel::<String>(10);
     {
         let msg_tx_clone = msg_tx.clone();
         tokio::spawn(async move {
@@ -263,82 +248,61 @@ async fn main() {
         });
     }
     loop {
-        let socket: TcpStream;
-        let socket_address: String;
-        let new_connections_tx = new_connections_tx.clone();
-        let mut new_connections_rx = new_connections_tx.subscribe();
-
         match listener.accept().await {
-            Ok((accepted_socket, accepted_address)) => {
-                socket = accepted_socket;
-                socket_address = accepted_address.to_string();
+            Ok((socket, socket_address)) => {
+                let socket_address = socket_address.to_string();
                 println!("{socket_address} connected!");
-                new_connections_tx.send(socket_address.clone()).unwrap();
+                let msg_tx = msg_tx.clone();
+                let mut msg_rx = msg_tx.subscribe();
+
+                let db_tx = db_tx.clone();
+
+                tokio::spawn(async move {
+                    let mut buf_reader = BufReader::new(socket);
+
+                    let mut line = String::new();
+                    let mut account =
+                        authenticate_user(&mut buf_reader, &socket_address, &db_tx, &msg_tx).await;
+                    loop {
+                        tokio::select! {
+                            result = handle_socket_input(
+                                &mut buf_reader,
+                                &mut line,
+                                &socket_address,
+                                &mut account,
+                                &db_tx,
+                                &msg_tx,
+                            ) => {
+                                if !result {
+                                    break;
+                                }
+                            }
+
+                            result = msg_rx.recv() => {
+                                if let Ok((sender_ip, message)) = result {
+                                    let keep_alive = handle_broadcast_message(
+                                        &mut buf_reader,
+                                        &socket_address,
+                                        &account,
+                                        &msg_tx,
+                                        sender_ip,
+                                        message,
+                                    ).await;
+
+                                    if !keep_alive {
+                                        break;
+                                    }
+                                }
+                            }
+
+                        }
+                    }
+                });
             }
             Err(..) => {
                 panic!();
             }
         }
-
-        let msg_tx = msg_tx.clone();
-        let mut msg_rx = msg_tx.subscribe();
-
-        let db_tx = db_tx.clone();
-
-        tokio::spawn(async move {
-            let mut buf_reader = BufReader::new(socket);
-
-            let mut line = String::new();
-            'loop_of_this_connection: loop {
-                match new_connections_rx.recv().await {
-                    Ok(addr) => {
-                        if addr != socket_address {
-                            continue;
-                        }
-                        let mut account =
-                            authenticate_user(&mut buf_reader, &socket_address, &db_tx, &msg_tx)
-                                .await;
-                        loop {
-                            tokio::select! {
-                                result = handle_socket_input(
-                                    &mut buf_reader,
-                                    &mut line,
-                                    &socket_address,
-                                    &mut account,
-                                    &db_tx,
-                                    &msg_tx,
-                                ) => {
-                                    if !result {
-                                        break 'loop_of_this_connection;
-                                    }
-                                }
-
-                                result = msg_rx.recv() => {
-                                    if let Ok((sender_ip, message)) = result {
-                                        let keep_alive = handle_broadcast_message(
-                                            &mut buf_reader,
-                                            &socket_address,
-                                            &account,
-                                            &msg_tx,
-                                            sender_ip,
-                                            message,
-                                        ).await;
-
-                                        if !keep_alive {
-                                            break 'loop_of_this_connection;
-                                        }
-                                    }
-                                }
-
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        continue;
-                    }
-                }
-            }
-        });
     }
 }
 
