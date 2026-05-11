@@ -71,7 +71,27 @@ struct Account {
     ip_addr: String,
     password: String,
 }
+pub struct Client {
+    stream: BufReader<TcpStream>,
+    account: Account,
+    addr: String,
+}
+impl Client {
+    async fn write_string(&mut self, message: String) {
+        self.stream.write_all(message.as_bytes()).await.unwrap();
+        self.stream.flush().await.unwrap();
+    }
 
+    async fn write_str(&mut self, message: &str) {
+        self.stream.write_all(message.as_bytes()).await.unwrap();
+        self.stream.flush().await.unwrap();
+    }
+}
+
+async fn write_str(buf_reader: &mut BufReader<TcpStream>, message: &str) {
+    buf_reader.write_all(message.as_bytes()).await.unwrap();
+    buf_reader.flush().await.unwrap();
+}
 #[tokio::main]
 async fn main() {
     let server_ip = "0.0.0.0:16831";
@@ -179,22 +199,22 @@ async fn main() {
         tokio::spawn(async move {
             let mut input_buf_reader = BufReader::new(tokio::io::stdin());
 
-            let mut readed_input_line = String::new();
+            let mut raw_input_line = String::new();
 
             'reading_loop: loop {
                 input_buf_reader
-                    .read_line(&mut readed_input_line)
+                    .read_line(&mut raw_input_line)
                     .await
                     .unwrap();
-                if !readed_input_line.contains(" ") {
+                if !raw_input_line.contains(" ") {
                     print_help_message().await;
-                    readed_input_line.clear();
+                    raw_input_line.clear();
                     continue 'reading_loop;
                 }
-                let input_line = readed_input_line.trim().to_string();
+                let input_line = raw_input_line.trim().to_string();
                 let command_name = input_line.split(" ").next().unwrap();
                 let rest_of_command = input_line.split_at(command_name.len() + 1).1;
-                readed_input_line.clear();
+                raw_input_line.clear();
                 if command_name.to_lowercase().eq("alert") {
                     msg_tx_clone
                         .send((
@@ -261,15 +281,23 @@ async fn main() {
                     let mut buf_reader = BufReader::new(socket);
 
                     let mut line = String::new();
-                    let mut account =
-                        authenticate_user(&mut buf_reader, &socket_address, &db_tx, &msg_tx).await;
+                    let Some(account) =
+                        authenticate_user(&mut buf_reader, &socket_address, &db_tx).await
+                    else {
+                        write_str(&mut buf_reader, "invalid account.").await;
+                        return;
+                    };
+                    let mut client = Client {
+                        stream: buf_reader,
+                        account,
+                        addr: socket_address,
+                    };
+                    post_login(&mut client, &db_tx, &msg_tx).await;
                     loop {
                         tokio::select! {
                             result = handle_socket_input(
-                                &mut buf_reader,
+                                &mut client,
                                 &mut line,
-                                &socket_address,
-                                &mut account,
                                 &db_tx,
                                 &msg_tx,
                             ) => {
@@ -281,9 +309,7 @@ async fn main() {
                             result = msg_rx.recv() => {
                                 if let Ok((sender_ip, message)) = result {
                                     let keep_alive = handle_broadcast_message(
-                                        &mut buf_reader,
-                                        &socket_address,
-                                        &account,
+                                        &mut client,
                                         &msg_tx,
                                         sender_ip,
                                         message,
@@ -309,16 +335,6 @@ async fn main() {
 //this is message separator
 const M_S: &str = "------------------------------\n";
 
-async fn write_string(reader: &mut BufReader<TcpStream>, message: String) {
-    reader.write_all(message.as_bytes()).await.unwrap();
-    reader.flush().await.unwrap();
-}
-
-async fn write_str(reader: &mut BufReader<TcpStream>, message: &str) {
-    reader.write_all(message.as_bytes()).await.unwrap();
-    reader.flush().await.unwrap();
-}
-
 async fn print_help_message() {
     print!("{M_S}");
     println!("Chat Commands:");
@@ -328,17 +344,15 @@ async fn print_help_message() {
     print!("{M_S}");
 }
 async fn handle_socket_input(
-    buf_reader: &mut BufReader<TcpStream>,
+    client: &mut Client,
     line: &mut String,
-    socket_address: &String,
-    account: &mut Option<Account>,
     db_tx: &mpsc::Sender<DatabaseRequest>,
     msg_tx: &broadcast::Sender<(String, Message)>,
 ) -> bool {
-    match buf_reader.read_line(line).await {
+    match client.stream.read_line(line).await {
         Ok(bytes_read) => {
             if bytes_read == 0 {
-                println!("{socket_address} disconnected!");
+                println!("{} disconnected!", client.addr);
                 return false;
             }
 
@@ -347,15 +361,13 @@ async fn handle_socket_input(
                 return true;
             }
 
-            let acc = account.clone().unwrap();
-
             msg_tx
                 .send((
-                    socket_address.clone(),
+                    client.addr.clone(),
                     Message::new(
                         MessageType::Chat,
-                        acc.uuid.clone(),
-                        acc.username.clone(),
+                        client.account.uuid.clone(),
+                        client.account.username.clone(),
                         line.trim().to_string(),
                     ),
                 ))
@@ -363,10 +375,10 @@ async fn handle_socket_input(
 
             db_tx
                 .send(DatabaseRequest::MessageAddition {
-                    requester_uuid: acc.uuid.clone(),
+                    requester_uuid: client.account.uuid.clone(),
                     message: Message::new(
                         MessageType::Chat,
-                        acc.uuid,
+                        client.account.uuid.clone(),
                         "error".to_string(),
                         line.trim().to_string(),
                     ),
@@ -384,7 +396,6 @@ async fn authenticate_user(
     buf_reader: &mut BufReader<TcpStream>,
     socket_address: &String,
     db_tx: &mpsc::Sender<DatabaseRequest>,
-    msg_tx: &broadcast::Sender<(String, Message)>,
 ) -> Option<Account> {
     write_str(buf_reader, "Type R/L to Register/Login.\n").await;
 
@@ -468,16 +479,25 @@ async fn authenticate_user(
         return None;
     }
 
-    write_str(buf_reader, "You can start typing.\n").await;
+    Some(account)
+}
+async fn post_login(
+    client: &mut Client,
+
+    db_tx: &mpsc::Sender<DatabaseRequest>,
+
+    msg_tx: &broadcast::Sender<(String, Message)>,
+) {
+    client.write_str("You can start typing.\n").await;
 
     msg_tx
         .send((
-            socket_address.clone(),
+            client.addr.clone(),
             Message::new(
                 MessageType::Broadcast,
-                account.uuid.clone(),
-                account.username.clone(),
-                format!("{} joined the chat!\n", account.username),
+                client.account.uuid.clone(),
+                client.account.username.clone(),
+                format!("{} joined the chat!\n", client.account.username),
             ),
         ))
         .unwrap();
@@ -490,61 +510,53 @@ async fn authenticate_user(
         .unwrap();
 
     if let Ok(messages) = resp_rx.await {
-        handle_previous_messages(buf_reader, messages).await;
+        handle_previous_messages(client, messages).await;
     }
-
-    Some(account)
 }
 async fn handle_broadcast_message(
-    buf_reader: &mut BufReader<TcpStream>,
-    socket_address: &String,
-    account: &Option<Account>,
+    client: &mut Client,
     msg_tx: &broadcast::Sender<(String, Message)>,
     sender_ip: String,
     message: Message,
 ) -> bool {
+    let acc = client.account.clone();
     match message.message_type {
         MessageType::Chat => {
-            if message.sender_uuid == account.clone().unwrap().uuid && sender_ip == *socket_address
-            {
+            if message.sender_uuid == acc.uuid && sender_ip == *client.addr {
                 return true;
             }
 
             let formatted = format!("{}: {}\n", message.sender_username, message.message);
-
-            write_string(buf_reader, formatted).await;
+            client.write_string(formatted).await;
         }
 
         MessageType::Broadcast => {
-            write_string(buf_reader, message.message).await;
+            client.write_string(message.message).await;
         }
 
         MessageType::Alert => {
-            write_string(
-                buf_reader,
-                format!("{M_S}Server message: {}\n{M_S}", message.message),
-            )
-            .await;
+            client
+                .write_string(format!("{M_S}Server message: {}\n{M_S}", message.message))
+                .await;
         }
 
         MessageType::Kick => {
-            let acc = account.clone().unwrap();
-
             if message.sender_username != acc.username && message.sender_username != acc.ip_addr {
                 return true;
             }
 
-            write_string(
-                buf_reader,
-                format!("{M_S}You are kicked!\nReason: {}\n{M_S}", message.message),
-            )
-            .await;
+            client
+                .write_string(format!(
+                    "{M_S}You are kicked!\nReason: {}\n{M_S}",
+                    message.message
+                ))
+                .await;
 
-            buf_reader.shutdown().await.unwrap();
+            client.stream.shutdown().await.unwrap();
 
             msg_tx
                 .send((
-                    socket_address.clone(),
+                    client.addr.clone(),
                     Message::new(
                         MessageType::Broadcast,
                         "error".to_string(),
@@ -560,12 +572,12 @@ async fn handle_broadcast_message(
 
     true
 }
-async fn handle_previous_messages(buf_reader: &mut BufReader<TcpStream>, messages: Vec<Message>) {
+async fn handle_previous_messages(client: &mut Client, messages: Vec<Message>) {
     let mut all = String::new();
 
     for message in messages {
         all.push_str(format!("{}: {}\n", message.sender_username, message.message).as_str());
     }
 
-    write_string(buf_reader, all).await;
+    client.write_string(all).await;
 }
